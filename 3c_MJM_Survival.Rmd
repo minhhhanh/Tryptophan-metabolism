@@ -1,0 +1,130 @@
+---
+title: "3c_MJM_Survival"
+author: "Hanh Nguyen Luu Minh"
+output: html_document
+---
+
+```{r}
+setwd("/home/ubuntu/tb_volume/hanhnlm/metabolomics")
+rm(list=ls())
+list.files("./deriveddata")
+print(load("./deriveddata/MULTIVJM_HIVNEG1_CV.RData"))
+print(load("./deriveddata/MULTIVJM_HIVPOS_CV.RData"))
+print(load("./deriveddata/Abundance_JMInput_April2026.RData"))
+```
+
+```{r}
+pacman::p_load(openxlsx, readxl, writexl, dplyr, tidyr, tidyverse, tibble, stringr, ggplot2, ggpubr, Hmisc, naniar, gtsummary, forcats, flextable, officer, kableExtra)
+```
+
+We studied the effect of longitudinal metabolites' trajectories on instantaneous hazard
+
+```{r}
+#> Prepare name map dictionary
+name_map <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "X5.HIAA" = "5-hydroxyindoleacetic acid",
+  "X5.HydroxyTryptamine" = "5-Hydroxytryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "Anthranilic acid",
+  "X5.HydroxyTryptophol" = "5-hydroxytryptophol",
+  "Alanine" = "Alanine",
+  "X3.IndoleaceticAcid" = "Indole-3-acetic acid",
+  "KynurenicAcid" = "Kynurenic acid"
+)
+```
+
+```{r HIV_negative_TBM}
+alpha.post <- do.call(
+  rbind,
+  lapply(results_multi_hivneg$mcmc$alphas, as.matrix)
+)
+dim(alpha.post) # 20k by 10 mets
+colnames(alpha.post) <- model.metname
+alpha.table <- data.frame(
+  metabolite = model.metname,
+  median = apply(alpha.post, 2, median),
+  sd = apply(alpha.post, 2, sd),
+  cri_low = apply(alpha.post, 2, quantile, 0.025),
+  cri_upp = apply(alpha.post, 2, quantile, 0.975)
+)
+alpha.table$z <- alpha.table$median / alpha.table$sd
+alpha.table$p <- 2 * pnorm(
+  -abs(alpha.table$z))
+alpha.table$fdr <- p.adjust(
+  alpha.table$p,
+  method = "BH")
+alpha.table$hr <- exp(alpha.table$median)
+alpha.table$hr_low <- exp(alpha.table$cri_low)
+alpha.table$hr_upp <- exp(alpha.table$cri_upp)
+alpha.table$metabolite <- name_map[alpha.table$metabolite]
+rownames(alpha.table) <- name_map[rownames(alpha.table)]
+
+#> Parsing the table
+table.doc <- alpha.table %>% dplyr::mutate(across(
+  c(median, sd, cri_low, cri_upp,
+    z, p, hr, hr_low, hr_upp, fdr),
+  ~ round(.x, 2)
+), `95% CrI` = paste0(hr_low, ",", hr_upp)) %>%
+  dplyr::select(metabolite,hr, `95% CrI`,p, fdr) %>% 
+  dplyr::rename(Metabolite = metabolite, HR = hr, `Wald p-value` = p,FDR = fdr)
+
+ft <- flextable(table.doc)
+ft <- autofit(ft)
+ft <- set_caption(
+  ft,
+  caption = "Association between longitudinal metabolites and survival hazard"
+)
+ft <- theme_booktabs(ft)
+doc <- read_docx()
+doc <- body_add_flextable(doc, ft)
+print(doc, target = "./tables/JM_survival_metabolite_table_hivneg.docx")
+```
+
+```{r HIV_positive_TBM}
+alpha.post <- do.call(
+  rbind,
+  lapply(results_multi_hivpos$mcmc$alphas, as.matrix)
+)
+dim(alpha.post) # 20k by 10 metabolites
+colnames(alpha.post) <- model.metname
+alpha.table <- data.frame(
+  metabolite = model.metname,
+  median = apply(alpha.post, 2, median),
+  sd = apply(alpha.post, 2, sd),
+  cri_low = apply(alpha.post, 2, quantile, 0.025),
+  cri_upp = apply(alpha.post, 2, quantile, 0.975)
+)
+alpha.table$z <- alpha.table$median / alpha.table$sd
+alpha.table$p <- 2 * pnorm(
+  -abs(alpha.table$z))
+alpha.table$fdr <- p.adjust(
+  alpha.table$p,
+  method = "BH")
+alpha.table$hr <- exp(alpha.table$median)
+alpha.table$hr_low <- exp(alpha.table$cri_low)
+alpha.table$hr_upp <- exp(alpha.table$cri_upp)
+alpha.table$metabolite <- name_map[alpha.table$metabolite]
+rownames(alpha.table) <- name_map[rownames(alpha.table)]
+
+table.doc <- alpha.table %>% dplyr::mutate(across(
+  c(median, sd, cri_low, cri_upp,
+    z, p, hr, hr_low, hr_upp, fdr),
+  ~ round(.x, 2)
+), `95% CrI` = paste0(hr_low, ",", hr_upp)) %>%
+  dplyr::select(metabolite,hr, `95% CrI`,p, fdr) %>% 
+  dplyr::rename(Metabolite = metabolite, HR = hr, `Wald p-value` = p,FDR = fdr)
+
+ft <- flextable(table.doc)
+ft <- autofit(ft)
+ft <- set_caption(
+  ft,
+  caption = "Association between longitudinal metabolites and survival hazard"
+)
+ft <- theme_booktabs(ft)
+doc <- read_docx()
+doc <- body_add_flextable(doc, ft)
+print(doc, target = "./tables/JM_survival_metabolite_table_hivpositive.docx")
+```
+

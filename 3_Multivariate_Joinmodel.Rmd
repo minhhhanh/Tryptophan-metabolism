@@ -1,0 +1,246 @@
+---
+title: "3_Multivariate_JM"
+author: "Hanh Nguyen Luu Minh"
+output: html_document
+---
+We used this model to study How Dexamethasone affects tryptophan metabolism profiles over time in both HIV-positive and HIV-negative TBM patients
+Variables are used in this analysis include: evedeath, ttdeath, treatment, and HIV
+
+```{r}
+setwd("/home/ubuntu/tb_volume/hanhnlm/metabolomics/")
+list.dirs(".")
+print(load("./deriveddata/Abundance_JMInput_April2026.RData"))
+```
+
+```{r}
+pacman::p_load(nlme, survival, JM, JMbayes2)
+set.seed(1234)
+```
+
+- We allow the interaction term in the longitudinal sub-model of the joint modeling, in the fixed effect part. The interaction term could also be specified in the random effect part (which is not used in our current approach).
+- When the interaction is include, the main effect coefficient beta1, beta2 for 2 variables day, treatment were interpreted as the association of that variable with outcome only when the other interacting variable is zero.
+- Interaction term interpretation: The effect of X1 on Y is expressed as beta1 + beta3. Thus, the slope of X1 is moderated by X2.
+- The unexplained variation is represented by the residual error in the equation: error at the individual observation level, measurement error or within subject fluctuation.
+- MCMC parameters: n_chains stand for number of parallel MCMC chains (how many indepedent Markov chains are run) -- This matters to the MCMC process cause more chains means better assessment of convergenece, allowing for the calculation of Gelman-Rubin R-hat, this parameter does not change posterior mean much, greatly affects trustworthiness of estimates
+
+```{r hiv-positive TBM}
+n_iter <- 15000L; n_burnin <- 10000L; n_thin <- 5L; n_chains <- 20
+metabolites <- c(
+  "Tryptophan", "Nicotinamide", "5-HIAA",
+  "5-HydroxyTryptamine", "Kynurenine",
+  "AntranilicAcid", "5-HydroxyTryptophol",
+  "Alanine", "3-IndoleaceticAcid", "KynurenicAcid"
+)
+dat_long <- jm_abu_inputdata_26$long_data %>% left_join(jm_abu_inputdata_26$surv_data %>% dplyr::select(Subject_id, SEX, AGE, TBMGRADE), by = "Subject_id")
+dat_surv <- jm_abu_inputdata_26$surv_data
+names(dat_long) <- make.names(names(dat_long))
+metabolites_safe <- make.names(metabolites)
+names(metabolites_safe) <- metabolites
+lme_list <- vector("list", length(metabolites))
+names(lme_list) <- metabolites_safe
+
+for (i in seq_along(metabolites)) {
+  metab_safe <- metabolites_safe[i]
+  
+  form <- reformulate(
+    termlabels = c("day", "arm", "day:arm", "AGE", "SEX"),
+    response = metab_safe
+  )
+  
+  lme_list[[i]] <- lme(
+    fixed = form,
+    random = ~ 1 + day | Subject_id,
+    data = dat_long,
+    na.action = na.exclude,
+    control = lmeControl(
+      msMaxIter = 20,
+      opt = "optim",
+      returnObject = TRUE
+    )
+  )
+}
+#> Sanity check
+sapply(lme_list, function(fit) identical(fit$data, lme_list[[1]]$data))
+sapply(lme_list, nobs)
+sapply(lme_list, function(fit)
+  length(unique(getData(fit)$Subject_id))
+)
+cox_26 <- coxph(Surv(tt_ev_2m, ev_2m) ~ arm + AGE + SEX + TBMGRADE,
+                data = dat_surv,
+                x = TRUE)
+# check fitting equation
+long_names <- sapply(lme_list, function(fit)
+  all.vars(formula(fit))[1]
+)
+ff <- lapply(names(lme_list), function(v) {
+  as.formula(paste0("~ value(", v, ")"))
+})
+names(ff) <- names(lme_list)
+results_multi_hivpos <- jm(
+  cox_26,
+  lme_list,
+  time_var = "day",
+  functional_forms = ff,
+  save_random_effects = TRUE,
+  n_chains = n_chains,
+  n_iter = n_iter,
+  n_burnin = n_burnin,
+  n_thin = n_thin
+)
+save(results_multi_hivpos, file = "./deriveddata/MULTIVJM_HIVPOS_CV.RData")
+rm(results_multi_hivpos)
+gc()
+```
+
+With the open-label of Dexamethasone for the group of patient of TT in the HIV-negative TBM cohort, we exclude the TT from analysis, and recheck the balance in covariates
+
+```{r hiv-positive TBM}
+library(cobalt)
+library(WeightIt)
+TT_ids <- jm_abu_inputdata_27$surv_data %>% dplyr::filter(LTA4H == "TT") %>% pull(Subject_id)
+valid_ids <- jm_abu_inputdata_27$surv_data %>%
+  dplyr::filter(LTA4H != "TT") %>%
+  dplyr::pull(Subject_id)
+surv_LTA4Hrm <- jm_abu_inputdata_27$surv_data %>%
+  dplyr::filter(Subject_id %in% valid_ids)
+long_LTA4Hrm <- jm_abu_inputdata_27$long_data %>%
+  dplyr::filter(Subject_id %in% valid_ids)
+bal.tab(arm ~ AGE + SEX + TBMGRADE + LTA4H + CSFWBC + CSFNEU + CSFLYM + CSFPROTEIN,
+        data = surv_LTA4Hrm,
+        estimand = "ATT", # average treatment effect of the treated
+        thresholds = c(m=.05))
+W.out <- weightit(arm ~ AGE + SEX + TBMGRADE + LTA4H + CSFWBC + CSFNEU + CSFLYM + CSFPROTEIN,
+        data = surv_LTA4Hrm, estimand = "ATT", method = "glm")
+bal.tab(
+  arm ~ AGE + SEX + TBMGRADE + LTA4H + CSFWBC + CSFNEU + CSFLYM + CSFPROTEIN,
+  data = surv_LTA4Hrm,
+  weights = W.out$weights,
+  estimand = "ATT",
+  thresholds = c(m = .05)
+)
+surv_LTA4Hrm$w_ATT <- W.out$weights
+surv_LTA4Hrm$ps <- W.out$ps
+ps_dat <- data.frame(
+  ps = W.out$ps,
+  arm = surv_LTA4Hrm$arm,
+  w = W.out$weights
+)
+p1 <- ggplot(ps_dat, aes(ps)) +
+  geom_histogram(
+    data = subset(ps_dat, arm == "Dexamethasone"),
+    aes(y = after_stat(count)),
+    bins = 30, fill = "darkred", alpha = 0.8
+  ) +
+  geom_histogram(
+    data = subset(ps_dat, arm == "Placebo"),
+    aes(y = -after_stat(count)),
+    bins = 30, fill = "steelblue", alpha = 0.8
+  ) +
+  # coord_flip() +
+  labs(
+    y = "Count (mirrored)",
+    x = "Propensity Score",
+    title = "Propensity Score Overlap Before Weighting"
+  ) + theme_bw() + theme(
+    axis.text = element_text(size = 15),
+    axis.text.x = element_text(color = "black", size = 13),
+    axis.title.x = element_text(size = 16, color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black", size = 13),
+    axis.title.y = element_text(size = 16, color = "black", face = "bold")
+  )
+p1
+
+p2 <- ggplot(ps_dat, aes(ps, weight = w)) +
+  geom_histogram(
+    data = subset(ps_dat, arm == "Dexamethasone"),
+    aes(y = after_stat(count)),
+    bins = 30, fill = "darkred", alpha = 0.8
+  ) +
+  geom_histogram(
+    data = subset(ps_dat, arm == "Placebo"),
+    aes(y = -after_stat(count)),
+    bins = 30, fill = "steelblue", alpha = 0.8
+  ) +
+  labs(
+    y = "Weighted Count (mirrored)",
+    x = "Propensity Score",
+    title = "Propensity Score Overlap AFTER Weighting"
+  ) +
+  theme_bw() + theme(
+    axis.text = element_text(size = 15),
+    axis.text.x = element_text(color = "black", size = 13),
+    axis.title.x = element_text(size = 16, color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black", size = 13),
+    axis.title.y = element_text(size = 16, color = "black", face = "bold")
+  )
+p2
+```
+
+```{r add metadata}
+id_order <- surv_LTA4Hrm$Subject_id
+surv_LTA4Hrm <- surv_LTA4Hrm %>%
+  dplyr::mutate(Subject_id = factor(Subject_id, levels = id_order))
+long_LTA4Hrm <- long_LTA4Hrm %>%
+  dplyr::mutate(Subject_id = factor(Subject_id, levels = id_order))
+jm_abu_inputdata_27$surv_LTA4Hrm <- surv_LTA4Hrm
+jm_abu_inputdata_27$long_LTA4Hrm <- long_LTA4Hrm
+
+save(jm_abu_inputdata_27, jm_abu_inputdata_26, file="./deriveddata/Abundance_JMInput_April2026.RData")
+```
+
+```{r hiv-positive TBM}
+n_iter <- 15000L; n_burnin <- 10000L; n_thin <- 5L; n_chains <- 20
+results_multi_hivneg <- list()
+dat_long <- jm_abu_inputdata_27$long_LTA4Hrm %>%
+  dplyr::mutate(
+    day = as.numeric(day),
+    Subject_id = factor(Subject_id),
+    arm = factor(arm, levels = c("Placebo", "Dexamethasone"))
+  )
+
+surv_dat <- jm_abu_inputdata_27$surv_LTA4Hrm %>%
+  dplyr::mutate(
+    Subject_id = factor(Subject_id),
+    arm = factor(arm, levels = c("Placebo", "Dexamethasone"))
+  )
+
+for (metab in metabolites) {
+  message("Running metabolite: ", metab)
+  
+  dat_tmp <- dat_long
+  dat_tmp$y <- dat_tmp[[metab]]
+  
+  lme_27 <- lme(
+    y ~ day * arm,
+    random = ~ 1 + day | Subject_id,
+    data = dat_tmp,
+    control = lmeControl(msMaxIter = 20, opt = "optim"),
+    na.action = na.omit
+  )
+  
+  cox_fit <- coxph(
+    Surv(tt_ev_2m, ev_2m) ~ arm + w_ATT,
+    data = surv_dat,
+    x = TRUE
+  )
+  
+  jm_27 <- jm(
+    Surv_object = cox_fit,
+    Mixed_objects = lme_27,
+    time_var = "day",
+    functional_forms = ~ value(y),
+    save_random_effects = TRUE,
+    n_iter = n_iter,
+    n_burnin = n_burnin,
+    n_thin = n_thin,
+    n_chains = n_chains,
+    cores = 5
+  )
+  
+  results_multi_hivneg[[metab]] <- jm_27
+}
+save(results_multi_hivneg,file = "./deriveddata/MULTIVJM_HIVNEG1_CV.RData")
+rm(results_multi_hivneg)
+gc()
+```
+

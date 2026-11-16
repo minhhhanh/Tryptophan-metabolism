@@ -1,0 +1,1023 @@
+---
+title: "3a_MJM_Inference"
+author: "Hanh Nguyen Luu Minh"
+output: html_document
+---
+```{r}
+setwd("/home/ubuntu/tb_volume/hanhnlm/metabolomics")
+rm(list=ls())
+list.files("./deriveddata")
+print(load("./deriveddata/MULTIVJM_HIVNEG1_CV.RData"))
+print(load("./deriveddata/MULTIVJM_HIVPOS_CV.RData"))
+print(load("./deriveddata/Abundance_JMInput_April2026.RData"))
+```
+
+```{r}
+pacman::p_load(openxlsx, readxl, writexl, dplyr, tidyr, tidyverse, tibble, stringr, ggplot2, ggpubr, Hmisc, naniar, gtsummary, forcats, flextable, officer, kableExtra)
+```
+
+```{r helper functions}
+#> Investigating the accuracy of inference by using MJM
+predict_long <- function(jm, cytokine_idx, day = 0, data.long, keep_iter = 1000) {
+  subjects <- as.character(jm$model_data$idT)
+  X_pred <- data.frame(Subject_id = subjects,
+                       arm = sapply(subjects, function(s) unique( data.long$arm[data.long$Subject_id == s])[1]),
+                       day = day)
+  
+  Zmat <- model.matrix(~ day, X_pred)
+  Xmat <- model.matrix(~ day * arm, X_pred)
+  K <- 2
+  idx_start <- (cytokine_idx - 1) * K + 1
+  idx_end   <- cytokine_idx * K
+  RE_idx <- idx_start:idx_end
+  n_chains <- length(jm$mcmc$b)
+  pred_list <- vector("list", keep_iter * n_chains)
+  counter <- 1
+  
+  for(chain in seq_len(n_chains)) {
+
+    for(iter in seq_len(keep_iter)) {
+
+      # random effects
+      b_all <- jm$mcmc$b[[chain]][ , RE_idx, iter]
+      # preserve matrix structure
+      b_all <- matrix(
+        b_all,
+        ncol = K
+      )
+      rand_part <- rowSums(
+        Zmat * b_all
+      )
+      # fixed effects
+      beta <- jm$mcmc[[paste0("betas", cytokine_idx)]][[chain]][iter, ]
+      fix_part <- as.vector(Xmat %*% beta)
+      pred <- fix_part + rand_part
+      names(pred) <- subjects
+      pred_list[[counter]] <- pred
+      counter <- counter + 1
+    }
+  }
+
+  return(pred_list)
+}
+#> Inference longitudinal trajectory
+predict_jm_trajectory <- function(
+    jm,
+    metabolite_idx,
+    data.long,
+    time_vec = c(0, 30),
+    keep_iter = NULL,
+    name_map = NULL
+) {
+
+  library(dplyr)
+
+  subjects <- as.character(jm$model_data$idT)
+  n_chains <- length(jm$mcmc$b)
+  if (is.null(keep_iter)) {
+    keep_iter <- nrow(jm$mcmc$betas1[[1]])
+  }
+  iter_use <- seq_len(keep_iter)
+  metname.model <- names(jm$model_data$extra_parms)
+  if (!is.null(name_map)) {
+    met_names <- unname(
+      name_map1[metname.model]
+    )
+  } else {
+    met_names <- metname.model
+  }
+  met_name <- met_names[metabolite_idx]
+  X_pred <- expand.grid(
+    Subject_id = subjects,
+    day = time_vec
+  )
+  X_pred$arm <- sapply(
+    X_pred$Subject_id,
+    function(s) {
+      unique(
+        data.long$arm[
+          data.long$Subject_id == s
+        ]
+      )[1]
+    }
+  )
+  X_pred$arm <- factor(X_pred$arm)
+  Zmat <- model.matrix( ~ day, X_pred)
+  Xmat <- model.matrix(
+    ~ day * arm,
+    X_pred
+  )
+  
+  K <- 2
+  RE_idx <- ((metabolite_idx - 1) * K + 1):(metabolite_idx * K)
+
+  pred_draws <- simplify2array(
+    lapply(iter_use, function(iter) {
+      do.call(cbind, lapply(seq_len(n_chains), function(chain) {
+          b_it <- jm$mcmc$b[[chain]][ , RE_idx, iter, drop = FALSE]
+          b_it <- matrix(b_it, ncol = K)
+          rand_part <- rowSums( Zmat * b_it[match(X_pred$Subject_id,
+                  subjects),
+                ,drop = FALSE])
+          beta_it <- jm$mcmc[[paste0("betas", metabolite_idx)]][[chain]][iter, ]
+          fix_part <- as.vector(Xmat %*% beta_it)
+          fix_part + rand_part
+        })
+      )
+    })
+  )
+  # Convert: prediction × chain × iteration -> prediction × posterior_draw
+  pred_mat <- matrix(
+    aperm(pred_draws, c(1, 3, 2)),
+    nrow = nrow(X_pred)
+  )
+  traj_df <- data.frame(
+    Subject_id = X_pred$Subject_id,
+    day = X_pred$day,
+    arm = X_pred$arm,
+    median = apply(pred_mat,1,median),
+    lwr = apply(pred_mat, 1, quantile,0.025),
+    upr = apply(pred_mat, 1, quantile, 0.975)
+  )
+  obs_df <- data.long %>% dplyr::select(Subject_id, day, arm, all_of(met_name))
+  final_df <- traj_df %>% left_join(
+      obs_df,by = c("Subject_id","day","arm" )) %>% 
+    dplyr::rename(pred = median, obs = all_of(met_name)) %>% 
+    dplyr::mutate(value = if_else(!is.na(obs),obs,pred),
+                  source = if_else(!is.na(obs),"observed","JM_imputed"), 
+                  metabolite = met_name)
+  # population-level trajectory
+  pop_grid <- expand.grid(
+    day = sort(unique(time_vec)),
+    arm = levels(X_pred$arm)
+  )
+  X_pop <- model.matrix(~ day * arm,pop_grid)
+
+  pop_draws <- simplify2array(
+    lapply(iter_use, function(iter) {
+      do.call(
+        cbind,
+        lapply(seq_len(n_chains), function(chain) {
+          beta_it <- jm$mcmc[[paste0("betas", metabolite_idx)]][[chain]][iter, ]
+          as.vector(X_pop %*% beta_it)
+        })
+      )
+    })
+  )
+  pop_mat <- matrix(
+    aperm(pop_draws, c(1, 3, 2)),
+    nrow = nrow(X_pop)
+  )
+  pop_df <- data.frame(
+    day = pop_grid$day,
+    arm = pop_grid$arm,
+    median = apply(pop_mat,1,median),
+    lwr = apply(pop_mat,1,quantile,0.025),
+    upr = apply(pop_mat,1,quantile,0.975),
+    metabolite = met_name
+  )
+  return(
+    list(
+      traj_df = traj_df,
+      final_df = final_df,
+      pop_df = pop_df,
+      pred_mat = pred_mat,
+      pop_mat = pop_mat
+    )
+  )
+}
+#> Wald p-value
+wald_from_samples <- function(x) {
+  est <- mean(x)
+  se <- sd(x)
+  z <- est / se
+  p <- 2 * (1 - pnorm(abs(z)))
+  data.frame(
+    estimate = est,
+    se = se,
+    z = z,
+    p = p
+  )
+}
+#> Summarise posterior distribution
+summarise_posterior <- function(x) {
+  x <- as.numeric(x)
+  data.frame(
+    median = median(x),
+    mean   = mean(x),
+    sd     = sd(x),
+    lwr    = quantile(x, 0.025),
+    upr    = quantile(x, 0.975)
+  )
+}
+#> Beta table report
+build_beta_table_mv <- function(jm,
+                                met_names) {
+  res_list <- lapply(seq_along(met_names),
+                     function(i) {
+                       met <- met_names[i]
+                       beta_mat <- beta_matrix(jm, i)
+                       post <- pop_slope_mv(jm = jm, metabolite_idx = i)
+                       placebo_sum <- summarise_posterior(post$placebo)
+                       dex_sum <- summarise_posterior(post$dexamethasone)
+                       delta_sum <- summarise_posterior(post$delta)
+                       
+                       beta_placebo <- beta_mat[, "day"]
+                       wald_placebo <- wald_from_samples(beta_placebo)
+                       beta_delta <- beta_mat[, "day:armDexamethasone"]
+                       wald_delta <- wald_from_samples(beta_delta)
+                       beta_dex <- beta_mat[, "day"] + beta_mat[, "day:armDexamethasone"]
+                       wald_dex <- wald_from_samples(beta_dex)
+                       
+                       delta_df <- data.frame(
+                         metabolite = met,
+                         contrast   = "Delta",
+                         median     = delta_sum$median,
+                         mean       = delta_sum$mean,
+                         sd         = delta_sum$sd,
+                         lwr        = delta_sum$lwr,
+                         upr        = delta_sum$upr,
+                         p          = wald_delta$p
+                       )
+                       placebo_df <- data.frame(
+                         metabolite = met,
+                         contrast   = "Placebo",
+                         median     = placebo_sum$median,
+                         mean       = placebo_sum$mean,
+                         sd         = placebo_sum$sd,
+                         lwr        = placebo_sum$lwr,
+                         upr        = placebo_sum$upr,
+                         p          = wald_placebo$p
+                       )
+                       dex_df <- data.frame(
+                         metabolite = met,
+                         contrast   = "Dexamethasone",
+                         median     = dex_sum$median,
+                         mean       = dex_sum$mean,
+                         sd         = dex_sum$sd,
+                         lwr        = dex_sum$lwr,
+                         upr        = dex_sum$upr,
+                         p          = wald_dex$p
+                       )
+                       rbind(placebo_df,
+                             dex_df,
+                             delta_df)
+                     })
+  beta_table <- do.call(rbind, res_list)
+  rownames(beta_table) <- NULL
+  return(beta_table)
+}
+get_beta_mat <- function(jm_fit, metabolite, lme_names) {
+  idx <- match(metabolite, lme_names)
+  if (is.na(idx)) stop("Metabolite not found")
+  beta_obj <- jm_fit$mcmc[[paste0("betas", idx)]]
+  ## Extract each chain and stack
+  beta_mat <- do.call(
+    rbind,
+    lapply(beta_obj, function(x) as.matrix(x))
+  )
+  beta_mat
+}
+extract_slope_posteriors_mv <- function(jm_fit, metabolite, lme_names) {
+  beta_mat <- get_beta_mat(jm_fit, metabolite, lme_names)
+  if (is.list(beta_mat)) {
+    beta_mat <- beta_mat[[metabolite]] %||% beta_mat[[1]]
+  }
+  beta_mat <- as.matrix(beta_mat)
+  beta_day <- beta_mat[, "day"]
+  beta_int <- beta_mat[, "day:armDexamethasone"]
+  list(
+    beta_placebo = beta_day,
+    beta_dex     = beta_day + beta_int,
+    delta_beta   = beta_int
+  )
+}
+#> Wald p-value for report
+Wald_P_cal_mv <- function(jm_fit, metabolite, lme_names,
+                          coef_name = "day:armDexamethasone") {
+
+  beta_mat <- get_beta_mat(jm_fit, metabolite, lme_names)
+
+  beta_vec <- beta_mat[, coef_name]
+
+  beta_vec <- as.numeric(beta_vec)
+
+  est <- mean(beta_vec)
+  se  <- sd(beta_vec)
+
+  z <- est / se
+  p <- 2 * (1 - pnorm(abs(z)))
+
+  return(p)
+}
+#> Visualisation helper function
+plot_met_trajectory <- function(met_name,
+                                all_final_df,
+                                all_pop_df,
+                                name_map = NULL) {
+  display_name <- if (!is.null(name_map)) {
+    unname(name_map[met_name])
+  } else {
+    met_name
+  }
+  stat_row <- delta_labels %>%
+    dplyr::filter(metabolite == met_name)
+  beta_text <- paste0(
+    "\u2206\u03B2 = ",
+    sprintf("%.3f", stat_row$beta),
+    " [",
+    sprintf("%.3f", stat_row$lwr),
+    ", ",
+    sprintf("%.3f", stat_row$upr),
+    "]",
+    "; Wald-FDR = ",
+    sprintf("%.3f", stat_row$fdr)
+  )
+  plot_dat <- all_final_df %>%
+    dplyr::filter(metabolite == met_name)
+  pop_dat <- all_pop_df %>%
+    dplyr::filter(metabolite == met_name)
+  
+  # y_top <- max(plot_dat$value, na.rm = TRUE)
+  
+  # x_left <- min(plot_dat$day, na.rm = TRUE)
+  
+  p <- ggplot() +
+    # subject-specific trajectories
+    geom_line(
+      data = plot_dat,
+      aes(
+        x = day,
+        y = value,
+        group = interaction(Subject_id, arm),
+        colour = arm
+      ),
+      alpha = 0.15,
+      linewidth = 0.4
+    ) +
+    # population CrI
+    geom_ribbon(
+      data = pop_dat,
+      aes(
+        x = day,
+        ymin = lwr,
+        ymax = upr,
+        fill = arm
+      ),
+      alpha = 0.25,
+      colour = NA
+    ) +
+    # population mean trajectory
+    geom_line(data = pop_dat,
+              aes(x = day,
+                  y = median,
+                  colour = arm),
+              linewidth = 1.4) +
+    annotate("text",x = 1, y = 4.8, label = beta_text,hjust = 0,vjust = 1,size = 4,color = "black") +
+    scale_x_continuous(breaks = c(0, 30)) +
+    coord_cartesian(ylim = c(-3, 5)) +
+    scale_colour_manual(values = c(
+      "Placebo" = "#1f77b4",
+      "Dexamethasone" = "#d62728"
+    )) +
+    scale_fill_manual(values = c(
+      "Placebo" = "#1f77b4",
+      "Dexamethasone" = "#d62728"
+    )) +
+    labs(
+      x = "Study day",
+      y = display_name,
+      colour = "Treatment",
+      fill = "Treatment"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 15,
+        hjust = 0.5
+      ),
+      aspect.ratio = 1,
+      plot.margin = margin(
+        t = 10,
+        r = 10,
+        b = 30,
+        l = 10
+      ),
+      axis.title.x = element_text(size = 15,
+                                  face = "bold"),
+      axis.title.y = element_text(size = 15,
+                                  face = "bold"),
+      axis.text.x = element_text(
+        size = 13,
+        face = "bold",
+        color = "black"
+      ),
+      axis.text.y = element_text(
+        size = 13,
+        face = "bold",
+        color = "black"
+      ),
+      strip.text = element_text(size = 14,
+                                face = "bold"),
+      legend.position = c(0.75, 0.18),
+      legend.background = element_rect(fill = alpha("white", 0.7),
+                                       colour = "white"),
+      legend.key = element_blank()
+    )
+  return(p)
+}
+```
+We prepare name mapping dictionary for different visualiasation purposes
+```{r name_map}
+name_map_tbl <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "X5.HIAA" = "5-HIAA",
+  "X5.HydroxyTryptamine" = "5-HydroxyTryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "AntranilicAcid",
+  "X5.HydroxyTryptophol" = "5-HydroxyTryptophol",
+  "Alanine" = "Alanine",
+  "X3.IndoleaceticAcid" = "3-IndoleaceticAcid",
+  "KynurenicAcid" = "KynurenicAcid"
+)
+name_map1 <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "X5.HIAA" = "5-HIAA",
+  "X5.HydroxyTryptamine" = "5-HydroxyTryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "AntranilicAcid",
+  "X5.HydroxyTryptophol" = "5-HydroxyTryptophol",
+  "Alanine" = "Alanine",
+  "X3.IndoleaceticAcid" = "3-IndoleaceticAcid",
+  "KynurenicAcid" = "KynurenicAcid"
+)
+name_map2 <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "5-HIAA" = "5-hydroxyindoleacetic acid",
+  "5-HydroxyTryptamine" = "5-Hydroxytryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "Anthranilic acid",
+  "5-HydroxyTryptophol" = "5-hydroxytryptophol",
+  "Alanine" = "Alanine",
+  "3-IndoleaceticAcid" = "Indole-3-acetic acid",
+  "KynurenicAcid" = "Kynurenic acid"
+)
+name_map3 <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "5-HIAA" = "5-hydroxyindoleacetic acid",
+  "5-HydroxyTryptamine" = "5-Hydroxytryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "Anthranilic acid",
+  "5-HydroxyTryptophol" = "5-hydroxytryptophol",
+  "Alanine" = "Alanine",
+  "3-IndoleaceticAcid" = "Indole-3-acetic acid",
+  "KynurenicAcid" = "Kynurenic acid"
+)
+met_order <- c(
+  "Tryptophan",
+  "Kynurenine",
+  "KynurenicAcid",
+  "AntranilicAcid",
+  "Nicotinamide",
+  "5-HydroxyTryptamine",
+  "5-HIAA",
+  "5-HydroxyTryptophol",
+  "3-IndoleaceticAcid",
+  "Alanine"
+)
+```
+
+```{r inference_accuracy_hivnegative}
+# results_multi_hivneg
+data.long <- jm_abu_inputdata_27$long_LTA4Hrm
+data.long$Subject_id <- factor(data.long$Subject_id)
+
+jm <- results_multi_hivneg
+metname.model <- names(results_multi_hivneg$model_data$extra_parms)
+
+metname.orig <- unname(name_map1[metname.model])
+plot_df_list <- vector("list",length(metname.model))
+rmse_tbl <- data.frame()
+#> prediction matrix
+for(metabolite_idx in seq_along(metname.model)) {
+    pred_list <- predict_long(
+        jm = results_multi_hivneg,
+        cytokine_idx = metabolite_idx,
+        day = 30,
+        data.long = data.long)
+    pred_mat <- do.call(cbind, pred_list)
+    pred_median <- apply(pred_mat,1,median)
+    obs_baseline <- data.long %>%
+        filter(day == 30) %>%
+        dplyr::select(Subject_id,obs = all_of(metname.orig[metabolite_idx]))
+    obs_baseline$pred <- pred_median[
+        match(obs_baseline$Subject_id,
+            names(pred_median))]
+    rmse <- sqrt(mean((obs_baseline$obs - obs_baseline$pred)^2,na.rm = TRUE))
+    obs_baseline$metabolite <- metname.orig[
+        metabolite_idx]
+    obs_baseline$RMSE <- rmse
+    plot_df_list[[metabolite_idx]] <- obs_baseline
+    
+    rmse_tbl <- rbind(
+        rmse_tbl,
+        data.frame(metabolite = metname.orig[metabolite_idx],RMSE = rmse))
+}
+plot_df <- bind_rows(plot_df_list)
+plot_df$metabolite <- name_map2[plot_df$metabolite]
+rmse_tbl$metabolite <- name_map2[rmse_tbl$metabolite]
+facet_labels <- setNames(
+    paste0(rmse_tbl$metabolite,
+        "\nRMSE = ",
+        round(rmse_tbl$RMSE, 2)),
+    rmse_tbl$metabolite)
+plot_df$metabolite <- factor(
+  plot_df$metabolite,
+  levels = met_order
+)
+p_all <- ggplot(plot_df,aes(x = obs, y = pred)) + 
+  geom_point(alpha = 0.5) + 
+  geom_smooth(
+        method = "lm",
+        color = "darkred",
+        fill = "#d62728",
+        se = TRUE) + 
+  facet_wrap(
+        ~ metabolite,
+        nrow = 2, ncol = 5,
+        scales = "free",
+        labeller = labeller(
+            metabolite = facet_labels)) +
+  labs(subtitle = NULL,
+        x = "Observed value",
+        y = "Predicted value")+ theme_bw()+
+  theme(panel.background=element_rect(fill = 'white', colour = 'white'),
+        axis.title.x = element_text(face="bold", colour="black", size=14),
+        axis.title.y = element_text(face="bold", colour="black", size=14),
+        axis.text.y = element_text(face="plain", colour="black", size=12),
+        axis.text.x = element_text(face="plain", colour="black", size=12),
+        axis.ticks.x=element_blank(),
+        legend.text = element_text(face="plain",size = 12),
+        legend.title = element_blank(),
+        legend.key = element_rect(colour = NA),
+        legend.position = "none",
+        strip.text=element_text(face = "bold", size=12),
+        panel.grid.minor = element_blank())
+
+p_all
+ggsave(
+  filename = "./plots/JM_inference_accuracy_HIVnegative_D30.tiff",
+  plot = p_all,
+  device = "tiff",
+  width = 17,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
+```{r inference_accuracy_hivpositive}
+data.long <- jm_abu_inputdata_26$long_data
+data.long$Subject_id <- factor(data.long$Subject_id)
+dim(data.long)
+head(data.long)
+table(data.long$day)
+jm <- results_multi_hivpos
+metname.model <- names(results_multi_hivpos$model_data$extra_parms)
+
+metname.orig <- unname(name_map1[metname.model])
+plot_df_list <- vector("list",length(metname.model))
+rmse_tbl <- data.frame()
+#> prediction matrix
+for(metabolite_idx in seq_along(metname.model)) {
+    pred_list <- predict_long(
+        jm = results_multi_hivpos,
+        cytokine_idx = metabolite_idx,
+        day = 0,
+        data.long = data.long)
+    pred_mat <- do.call(cbind, pred_list)
+    pred_median <- apply(pred_mat,1,median)
+    obs_baseline <- data.long %>%
+        filter(day == 0) %>%
+        dplyr::select(Subject_id,obs = all_of(metname.orig[metabolite_idx]))
+    obs_baseline$pred <- pred_median[
+        match(obs_baseline$Subject_id,
+            names(pred_median))]
+    rmse <- sqrt(mean((obs_baseline$obs - obs_baseline$pred)^2,na.rm = TRUE))
+    obs_baseline$metabolite <- metname.orig[
+        metabolite_idx]
+    obs_baseline$RMSE <- rmse
+    plot_df_list[[metabolite_idx]] <- obs_baseline
+    
+    rmse_tbl <- rbind(
+        rmse_tbl,
+        data.frame(metabolite = metname.orig[metabolite_idx],RMSE = rmse))
+}
+plot_df <- bind_rows(plot_df_list)
+
+plot_df$metabolite <- name_map2[plot_df$metabolite]
+rmse_tbl$metabolite <- name_map2[rmse_tbl$metabolite]
+facet_labels <- setNames(
+    paste0(rmse_tbl$metabolite,
+        "\nRMSE = ",
+        round(rmse_tbl$RMSE, 2)),
+    rmse_tbl$metabolite)
+
+plot_df$metabolite <- factor(
+  plot_df$metabolite,
+  levels = met_order
+)
+p_all <- ggplot(plot_df,aes(x = obs, y = pred)) + 
+  geom_point(alpha = 0.5) + 
+  geom_smooth(
+        method = "lm",
+        color = "darkred",
+        fill = "#d62728",
+        se = TRUE) + 
+  facet_wrap(
+        ~ metabolite,
+        nrow = 2, ncol = 5,
+        scales = "free",
+        labeller = labeller(
+            metabolite = facet_labels)) +
+  labs(subtitle = NULL,
+        x = "Observed value",
+        y = "Predicted value")+ theme_bw()+
+  theme(panel.background=element_rect(fill = 'white', colour = 'white'),
+        axis.title.x = element_text(face="bold", colour="black", size=14),
+        axis.title.y = element_text(face="bold", colour="black", size=14),
+        axis.text.y = element_text(face="plain", colour="black", size=12),
+        axis.text.x = element_text(face="plain", colour="black", size=12),
+        axis.ticks.x=element_blank(),
+        legend.text = element_text(face="plain",size = 12),
+        legend.title = element_blank(),
+        legend.key = element_rect(colour = NA),
+        legend.position = "none",
+        strip.text=element_text(face = "bold", size=12),
+        panel.grid.minor = element_blank())
+
+p_all
+ggsave(
+  filename = "./plots/JM_imputation_accuracy_HIVpositive_D0.tiff",
+  plot = p_all,
+  device = "tiff",
+  width = 17,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
+```{r MJM_Inference_Table}
+met_names <- names(results_multi_hivneg$model_data$extra_parms)
+beta_table_mv_hivnegative <- build_beta_table_mv(
+  jm = results_multi_hivneg,
+  met_names = met_names)
+beta_table_mv_hivnegative$fdr <- p.adjust(
+  beta_table_mv$p,
+  method = "BH")
+beta_table_mv_hivnegative$metabolite <- name_map_tbl[beta_table_mv_hivnegative$metabolite]
+
+met_names <- names(results_multi_hivpos$model_data$extra_parms)
+beta_table_mv_hivpositive <- build_beta_table_mv(
+  jm = results_multi_hivpos,
+  met_names = met_names)
+beta_table_mv_hivpositive$fdr <- p.adjust(
+  beta_table_mv$p,
+  method = "BH")
+beta_table_mv_hivpositive$metabolite <- name_map_tbl[beta_table_mv_hivpositive$metabolite]
+
+beta_table_mv_hivnegative$cohort <- "HIV-negative"
+beta_table_mv_hivpositive$cohort <- "HIV-positive"
+
+beta_table_all <- dplyr::bind_rows(
+  beta_table_mv_hivnegative,
+  beta_table_mv_hivpositive
+)
+
+beta_table_all$contrast <- factor(
+  beta_table_all$contrast,
+  levels = c(
+    "Placebo",
+    "Dexamethasone",
+    "Delta"
+  )
+)
+beta_table_all$metabolite <- factor(
+  beta_table_all$metabolite,
+  levels = met_order
+)
+beta_all_fmt <- beta_table_all %>%
+  mutate(
+    est_cri = sprintf(
+      "%.3f [%.3f, %.3f]",
+      median,
+      lwr,
+      upr
+    ),
+    
+    p = ifelse(
+      is.na(p),
+      "",
+      formatC(p, format = "e", digits = 2)
+    ),
+    
+    fdr = ifelse(
+      is.na(fdr),
+      "",
+      formatC(fdr, format = "e", digits = 2)
+    )
+  ) %>%
+  dplyr::arrange(
+    cohort,
+    metabolite,
+    contrast
+  ) %>%
+  dplyr::select(
+    cohort,
+    metabolite,
+    contrast,
+    est_cri,
+    p,
+    fdr
+  ) %>%
+  rename(
+    Cohort = cohort,
+    Metabolite = metabolite,
+    Contrast = contrast,
+    `β [95% CrI]` = est_cri,
+    `Wald-p` = p,
+    `BH-FDR` = fdr
+  )
+
+ft <- flextable(beta_all_fmt)
+ft <- theme_booktabs(ft)
+ft <- autofit(ft)
+ft <- merge_v(ft,j = c("Cohort", "Metabolite"))
+ft <- valign(ft,valign = "top",part = "body")
+ft <- bold(ft,part = "header")
+ft <- align(ft,align = "center",part = "all")
+doc <- read_docx()
+doc <- body_add_par(doc,
+  "Population-level longitudinal slopes from multivariate joint models",
+  style = "heading 1")
+doc <- body_add_flextable(doc,value = ft)
+print(doc,target = "./tables/MJM_trajectory_2cohorts.docx")
+```
+
+```{r multivariate_MJM}
+#> HIV-positive TBM
+beta_table_mv <- lapply(names(lme_list), function(met) {
+  betas <- extract_slope_posteriors_mv(
+    results_multi_hivpos,
+    met,
+    names(lme_list)
+  )
+  data.frame(
+    metabolite = met,
+    rbind(
+      Placebo       = summarise_beta(betas$beta_placebo),
+      Dexamethasone = summarise_beta(betas$beta_dex),
+      Delta         = summarise_beta(betas$delta_beta)
+    )
+  )
+})
+beta_table_mv <- do.call(rbind, beta_table_mv)
+beta_table_fmt_mv <- beta_table_mv %>%
+  dplyr::mutate(
+    est_cri = sprintf(
+      "%.3f [%.3f, %.3f]",
+      median, lwr.2.5., upr.97.5.
+    )
+  )
+#> HIV-negative TBM
+beta_table_mv_hivnegative <- build_beta_table_mv(
+  jm = results_multi_hivneg,
+  met_names = met_names)
+beta_table_mv_hivnegative$fdr <- p.adjust(
+  beta_table_mv$p,
+  method = "BH")
+beta_table_mv_hivnegative$metabolite <- name_map_tbl[beta_table_mv_hivnegative$metabolite]
+
+met_names <- names(results_multi_hivpos$model_data$extra_parms)
+beta_table_mv_hivpositive <- build_beta_table_mv(
+  jm = results_multi_hivpos,
+  met_names = met_names)
+beta_table_mv_hivpositive$fdr <- p.adjust(
+  beta_table_mv$p,
+  method = "BH")
+beta_table_mv_hivpositive$metabolite <- name_map_tbl[beta_table_mv_hivpositive$metabolite]
+
+#> Summarize 2 cohorts
+beta_table_mv_hivnegative$cohort <- "HIV-negative"
+beta_table_mv_hivpositive$cohort <- "HIV-positive"
+
+beta_table_all <- dplyr::bind_rows(
+  beta_table_mv_hivnegative,
+  beta_table_mv_hivpositive
+)
+
+beta_table_all$contrast <- factor(
+  beta_table_all$contrast,
+  levels = c(
+    "Placebo",
+    "Dexamethasone",
+    "Delta"
+  )
+)
+beta_table_all$metabolite <- factor(
+  beta_table_all$metabolite,
+  levels = met_order
+)
+beta_all_fmt <- beta_table_all %>%
+  mutate(
+    est_cri = sprintf(
+      "%.3f [%.3f, %.3f]",
+      median,
+      lwr,
+      upr
+    ),
+    
+    p = ifelse(
+      is.na(p),
+      "",
+      formatC(p, format = "e", digits = 2)
+    ),
+    
+    fdr = ifelse(
+      is.na(fdr),
+      "",
+      formatC(fdr, format = "e", digits = 2)
+    )
+  ) %>%
+  dplyr::arrange(
+    cohort,
+    metabolite,
+    contrast
+  ) %>%
+  dplyr::select(
+    cohort,
+    metabolite,
+    contrast,
+    est_cri,
+    p,
+    fdr
+  ) %>%
+  rename(
+    Cohort = cohort,
+    Metabolite = metabolite,
+    Contrast = contrast,
+    `β [95% CrI]` = est_cri,
+    `Wald-p` = p,
+    `BH-FDR` = fdr
+  )
+
+ft <- flextable(beta_all_fmt)
+ft <- theme_booktabs(ft)
+ft <- autofit(ft)
+ft <- merge_v(ft,j = c("Cohort", "Metabolite"))
+ft <- valign(ft,valign = "top",part = "body")
+ft <- bold(ft,part = "header")
+ft <- align(ft,align = "center",part = "all")
+doc <- read_docx()
+doc <- body_add_par(doc,
+  "Population-level longitudinal slopes from multivariate joint models",
+  style = "heading 1")
+doc <- body_add_flextable(doc,value = ft)
+print(doc,target = "./tables/MJM_trajectory_2cohorts.docx")
+```
+
+We visualize the longitudinal changes of tryptophan metabolites in HIV-negative TBM cohort
+```{r}
+all_res <- lapply(
+  seq_along(names(results_multi_hivneg$model_data$extra_parms)),
+  function(i) {
+    predict_jm_trajectory(
+      jm = results_multi_hivneg,
+      metabolite_idx = i,
+      data.long = jm_abu_inputdata_27$long_LTA4Hrm,
+      time_vec = c(0, 30),
+      name_map = name_map1
+    )
+  })
+
+all_pop_df <- dplyr::bind_rows(lapply(all_res, `[[`, "pop_df"))
+all_obs_df <- dplyr::bind_rows(lapply(all_res, `[[`, "obs_df"))
+all_final_df <- dplyr::bind_rows(lapply(all_res, `[[`, "final_df"))
+sum(is.na(all_final_df$obs))
+
+delta_labels <- beta_table_mv %>%
+  dplyr::filter(contrast == "Delta") %>%
+  dplyr::mutate(
+    label = sprintf(
+      "\u2206\u03B2 = %.3f [%.3f, %.3f]; Wald-p = %.3f",
+      median,
+      lwr,
+      upr,
+      fdr
+    )
+  ) %>%
+  dplyr::mutate(
+    metabolite = dplyr::recode(
+      metabolite,
+      !!!name_map_delta
+    )
+  )
+
+beta_table_display <- beta_table_mv
+beta_table_display$metabolite <- name_map[beta_table_display$metabolite]
+beta_table_display
+
+plot_list <- lapply(
+  met_order, function(met_name) {
+    plot_met_trajectory(
+      met_name = met_name,
+      all_final_df = all_final_df,
+      all_pop_df = all_pop_df,
+      name_map = name_map3)
+    })
+combined_plot <- patchwork::wrap_plots(plot_list, ncol = 5)
+combined_plot
+
+ggsave(
+  filename = "./plots/HIVneg_trajectory.tiff",
+  plot = combined_plot,
+  device = "tiff",
+  width = 23,
+  height = 14,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+Doing the same for HIV-negative TBM cohort
+```{r}
+all_res <- lapply(
+  seq_along(names(results_multi_hivpos$model_data$extra_parms)),
+  function(i) {
+    predict_jm_trajectory(
+      jm = results_multi_hivpos,
+      metabolite_idx = i,
+      data.long = jm_abu_inputdata_26$long_data,
+      time_vec = c(0, 30),
+      name_map = name_map1
+    )
+  })
+
+all_pop_df <- dplyr::bind_rows(lapply(all_res, `[[`, "pop_df"))
+all_obs_df <- dplyr::bind_rows(lapply(all_res, `[[`, "obs_df"))
+all_final_df <- dplyr::bind_rows(lapply(all_res, `[[`, "final_df"))
+sum(is.na(all_final_df$obs))
+
+delta_labels <- beta_table_mv %>%
+  dplyr::filter(contrast == "Delta") %>%
+  dplyr::mutate(
+    label = sprintf(
+      "\u2206\u03B2 = %.3f [%.3f, %.3f]; Wald-p = %.3f",
+      median,
+      lwr,
+      upr,
+      fdr
+    )
+  ) %>%
+  dplyr::mutate(
+    metabolite = dplyr::recode(
+      metabolite,
+      !!!name_map_delta
+    )
+  )
+
+beta_table_display <- beta_table_mv
+beta_table_display$metabolite <- name_map[beta_table_display$metabolite]
+beta_table_display
+
+plot_list <- lapply(
+  met_order, function(met_name) {
+    plot_met_trajectory(
+      met_name = met_name,
+      all_final_df = all_final_df,
+      all_pop_df = all_pop_df,
+      name_map = name_map3)
+    })
+combined_plot <- patchwork::wrap_plots(plot_list, ncol = 5)
+combined_plot
+
+ggsave(
+  filename = "./plots/HIVpos_trajectory.tiff",
+  plot = combined_plot,
+  device = "tiff",
+  width = 23,
+  height = 14,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+

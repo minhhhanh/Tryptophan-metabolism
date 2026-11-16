@@ -1,0 +1,343 @@
+---
+title: "Metabolite Project - Mediation analysis"
+author: "Nguyen Luu Minh Hanh"
+output:
+  html_document:
+    df_print: paged
+echo: false
+include: false
+editor_options:
+  chunk_output_type: console
+---
+# Libs
+```{r}
+pacman::p_load(openxlsx, readxl, writexl, dplyr, tidyr, tidyverse, tibble, stringr, ggplot2, ggpubr, Hmisc, naniar, gtsummary, forcats, flextable, CMAverse, cowplot, patchwork)
+library(survival)
+library(purrr)
+```
+# Path
+```{r}
+setwd("/home/hanhnlm@oucru.org/hanhnlm/metabolomics")
+list.files(".")
+```
+
+```{r}
+data.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data")
+clinical.dir <- paste0(data.dir, "/clinical")
+untarget_met.dir <- paste0(data.dir, "/RCT_Untargeted_Metabolomics")
+target_met.dir <- paste0(data.dir, "/RCT_Targeted_Metabolomics")
+derived.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data\\Hanh_derived_data")
+output.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\results_nov")
+```
+
+```{r load_data}
+print(load("./deriveddata/MULTIVJM_HIVNEG1_CV.RData")) # results_hivneg
+print(load("./deriveddata/Abundance_JMInput_April2026.RData"))
+print(load("./deriveddata/UpdatedClinical_Mar2026.RData"))
+set.seed(1234)
+```
+
+For this mediation analysis, we ask: "How much of the treatment effect of Dexamethasone on survival is mediated through the biomarker slope?"
+the workflow is conducted as: 
+Posterior slope draw (joint model) -> Mediation model -> Effect estimate
+
+```{r}
+#> Prepare function
+source("~/hanhnlm/metabolomics/script/subject_slope_extract.R")
+source("~/hanhnlm/metabolomics/script/mediation_function.R")
+safe_extract <- function(res, row, col) {
+    if (row %in% rownames(res) && col %in% colnames(res)) {
+      return(res[row, col])
+    } else {
+      return(NA)
+    }
+}
+summarize_mediation1 <- function(df, N, k) {
+  pool_one <- function(est, lwr, upr, name = "") {
+    keep <- complete.cases(est, lwr, upr)
+    est <- est[keep]
+    lwr <- lwr[keep]
+    upr <- upr[keep]
+    
+    m <- length(est)
+    
+    # Log transformation
+    log_est <- log(est)
+    log_lwr <- log(lwr)
+    log_upr <- log(upr)
+    
+    # SE from CI
+    se <- (log_upr - log_lwr) / (2 * 1.96)
+    var <- se^2
+    
+    # RR pooling
+    theta_bar <- mean(log_est)
+    W <- mean(var)
+    B <- var(log_est)
+    T_var <- W + (1 + 1/m) * B
+    se_total <- sqrt(T_var)
+    
+    # Barnard-Rubin df
+    RIV <- ifelse(W > 0, ((1 + 1/m)*B) / W, NA)
+    lambda <- ((1 + 1/m)*B) / T_var
+    
+    df_old <- (m - 1) * (1 + 1/RIV)^2
+    df_complete <- N - k
+    df_obs <- (df_complete + 1) / (df_complete + 3) * df_complete * (1 - lambda)
+    df_adj <- df_old * df_obs / (df_old + df_obs)
+    
+    t_crit <- qt(0.975, df = df_adj)
+    
+    log_lower <- theta_bar - t_crit * se_total
+    log_upper <- theta_bar + t_crit * se_total
+    
+    t_stat <- theta_bar / se_total
+    p_val <- 2 * (1 - pt(abs(t_stat), df = df_adj))
+    
+    # Back-transform
+    rubin_HR <- exp(theta_bar)
+    CI_lower <- exp(log_lower)
+    CI_upper <- exp(log_upper)
+    
+    # Diagnostics
+    skew_log <- mean((log_est - mean(log_est))^3) / sd(log_est)^3
+    normal_flag <- ifelse(abs(skew_log) < 0.5, "approx normal", "skewed")
+    
+    # Plots
+    plot_df <- data.frame(log_est = log_est)
+    
+    p_qq <- ggplot(plot_df, aes(sample = log_est)) + 
+      stat_qq() + stat_qq_line(color = "#A62C2A") +
+      theme_bw() +
+      labs(title = paste0(name, " log-scale Q-Q plot"))
+    
+    p_log_density <- ggplot(plot_df, aes(x = log_est)) +
+      geom_density(fill = "#B2C1D6", alpha = 0.5) +
+      stat_function(
+        fun = dnorm,
+        args = list(mean = mean(log_est), sd = sd(log_est)),
+        color = "#A62C2A",
+        linewidth = 1
+      ) +
+      labs(
+        title = paste0(name, " log-scale density"),
+        subtitle = "Blue = empirical, Red = normal",
+        x = "Log(HR)",
+        y = "Density"
+      ) + 
+      theme_bw()
+    
+    list(
+      summary = tibble(
+        Effect = name,
+        HR = rubin_HR,
+        CI_lower = CI_lower,
+        CI_upper = CI_upper,
+        SE = se_total,
+        DF = df_adj,
+        P_value = p_val,
+        WithinVar = W,
+        BetweenVar = B,
+        TotalVar = T_var,
+        RIV = RIV,
+        FMI = lambda,
+        LogSkewness = skew_log,
+        LogNormality = normal_flag
+      ),
+      qqplot = p_qq,
+      log_density = p_log_density
+    )
+  }
+  # Effects
+  res_TE  <- pool_one(df$TE_est, df$TE_lwr, df$TE_upr, "TE")
+  res_NDE <- pool_one(df$NDE_est, df$NDE_lwr, df$NDE_upr, "NDE")
+  res_NIE <- pool_one(df$NIE_est, df$NIE_lwr, df$NIE_upr, "NIE")
+  
+  # PM (empirical)
+  pm_est <- df$PM_est
+  pm_summary <- tibble(
+    Effect = "PM",
+    HR = median(pm_est, na.rm = TRUE),
+    CI_lower = quantile(pm_est, 0.025, na.rm = TRUE),
+    CI_upper = quantile(pm_est, 0.975, na.rm = TRUE)
+  )
+  list(
+    table = bind_rows(
+      res_TE$summary,
+      res_NDE$summary,
+      res_NIE$summary,
+      pm_summary
+    ),
+    qqplots = list(
+      TE = res_TE$qqplot,
+      NDE = res_NDE$qqplot,
+      NIE = res_NIE$qqplot
+    ),
+    logdensplots = list(
+      TE = res_TE$log_density,
+      NDE = res_NDE$log_density,
+      NIE = res_NIE$log_density
+    )
+  )
+}
+```
+
+```{r}
+jm <- results_multi_hivneg
+dat_long <- jm_abu_inputdata_27$long_LTA4Hrm
+dat_surv <- jm_abu_inputdata_27$surv_LTA4Hrm |> left_join(bsl_clinic_27tb |> dplyr::filter(Subject_id %in% jm_abu_inputdata_27$surv_LTA4Hrm$Subject_id) |> 
+                                                            dplyr::select(Subject_id, ev_death_12m, tt_death_12m), by = "Subject_id")
+time_var <- "day"; trt_var = "armDexamethasone"
+subject_slopes_list <- lapply(seq_along(names(jm$model_data$extra_parms)), function(metabolite_idx) {
+  get_subject_slopes(
+    jm = jm,
+    data_long = dat_long,
+    dat_surv = dat_surv,
+    metabolite_idx = metabolite_idx,
+    time_var = time_var,
+    trt_var = trt_var
+  )
+})
+
+original_names <- names(dat_long)
+name_map <- setNames(
+  original_names,
+  make.names(original_names))
+
+met_names_original <- unname(name_map[names(jm$model_data$extra_parms)])
+names(subject_slopes_list) <- met_names_original
+```
+
+For each metabolite:slope_mat → mediation → summary → combine all metabolites
+```{r}
+target_mets <- c(
+  "Tryptophan",
+  "Kynurenine",
+  "KynurenicAcid",
+  "AntranilicAcid",
+  "Alanine"
+)
+cmest_args <- modifyList(
+  default_cmest,
+  list(
+    model = "gformula",
+    basec = c("AGE","SEX","LTA4H","TBMGRADE","CSFWBC","CSFPROTEIN"),
+    mreg = list("linear"),
+    yreg = "coxph",
+    nboot = 500,
+    a = "Dexamethasone",
+    astar = "Placebo"
+  )
+)
+mediation_results_12m <- lapply(target_mets, function(met_name) {
+  message("Running mediation for: ", met_name)
+  res <- run_mediation(
+    slope_mat = subject_slopes_list[[met_name]],
+    analysis_df = dat_surv,
+    cmest_args = cmest_args,
+    n_draws = 2000
+  )
+  df <- res$draws
+  df$metabolite <- met_name
+  df
+})
+#> saving results: list of mediation results
+#> 
+names(mediation_results_12m) <- target_mets
+save(mediation_results_12m, file = file.path("/home/hanhnlm@oucru.org/hanhnlm/metabolomics/deriveddata/MediationAnalysis_27TB_July202026.RData"))
+```
+## Result parsing
+```{r}
+load(file.path(output.dir, "MediationAnalysis_27TB_July202026.RData"))
+names(mediation_results)
+lapply(mediation_results, function(col) table(col$warning, useNA = "ifany"))
+warning_summary <- sapply(mediation_results, function(col) {
+  c(
+    n_warning = sum(!is.na(col$warning)),
+    n_total = nrow(col)
+  )
+}) %>% t() %>% as.data.frame()
+warning_summary
+#> remove non-convert iteration
+mediation_results_clean <- lapply(mediation_results, function(col) {
+  col %>% dplyr::filter(is.na(warning) |warning == "")
+})
+lapply(mediation_results_clean, function(col) dim(col))
+#> The extracted effects are ration measures already (Rte, Rtnde, Rtnie, Rpnde, Rpnie)
+```
+
+```{r summary_and_diagnosis}
+#> A hazard ratio (HR) of 1 means there is no difference in the risk of an event occurring between two groups being compared.
+N <- length(unique(analysis_df$Subject_id))
+k <- length(coef(cox_27))
+all_summary <- lapply(
+  mediation_results_clean,
+  function(x) summarize_mediation1(x, N = N, k = k)
+)
+save(all_summary, file = file.path(output.dir, "CMAverse_summary.RData"))
+
+#> In the table
+##> Empirical inference (this is the primary result, directly drawn from the posterior-based approach). The log-HR across 1k posterior draws and mediation estimates was estimated by taking the median of the distribution, storing in the estimate_log column. Along with the median of estimates, the 95% credible interval was inferred, storing in CI_upper_log and CI_lower_log. For a more easier interpretation, the HR and HR CrI was estimated by taking the exponential of the **_log columns. In the agreement with the Bayesian framework, I report the posterior probability (P_log_gt0 and P_exp_gt1). Besides, I also provide the Rubin pooling estimates (Rubin_*) assuming normality and the Rubin_p is the frequentist-style p-value for hypothesis testing. It should be noted down that the estimates was pooled under the log scaled data, before being exponentiated.
+```
+
+```{r group_forest}
+df_group_forest <- map_dfr(
+  names(all_summary),
+  function(met) {
+    all_summary[[met]]$table %>%
+      dplyr::filter(Effect %in% c("TE", "NDE", "NIE")) %>%
+      dplyr::mutate(Metabolite = met)
+  }
+)
+df_group_forest <- df_group_forest %>%
+  dplyr::mutate(
+    Effect = factor(Effect, levels = c("TE", "NIE", "NDE")),
+    label = sprintf("%.2f [%.2f, %.2f]; p=%.3f",
+                    HR, CI_lower, CI_upper, P_value),
+    Metabolite = factor(Metabolite)
+  ) %>% dplyr::filter(Metabolite %in% c("Tryptophan","Kynurenine","KynurenicAcid","AntranilicAcid","Alanine"))
+ggplot(df_group_forest, aes(x = HR, y = Metabolite, color = Effect)) +
+  geom_point(
+    position = position_dodge(width = 0.6),
+    size = 3
+  ) +
+  geom_text(
+      aes(label = label), hjust = -0.1, size = 3.5,
+      position = position_dodge(width = 0.6), vjust = -0.5,
+      fontface = "bold", show.legend = F) + 
+  geom_errorbar(
+    aes(xmin = CI_lower, xmax = CI_upper),
+    orientation = "y",
+    position = position_dodge(width = 0.6),
+    width = 0.3
+  ) +
+  geom_vline(xintercept = 1, linetype = "dashed") + 
+  scale_x_log10(
+    breaks = c(0.25, 0.5, 1, 2),
+    limits = c(0.25, 3)
+  ) +
+  scale_color_manual(values = c(
+    "TE" = "#A62C2A",
+    "NIE" = "#0072B2",
+    "NDE" = "#009E73"
+  )) + 
+  labs(
+    x = "Hazard Ratio (HR)",
+    y = NULL,
+    color = "Effect"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+          axis.title.x = element_text(face="bold", colour="black", size=12),
+          axis.title.y = element_text(face="bold", colour="black", size=12),
+          axis.text.y = element_text(face="bold", colour="black", size=13),
+          axis.text.x = element_text(face="bold", colour="black", size=13),
+          axis.ticks.x=element_blank(),
+          legend.text = element_text(size = 13),
+          legend.title = element_text( colour="black", size=15),
+          strip.text=element_text(face = "bold",size=12)) +
+    theme(plot.title = element_text(hjust = 0.5,face="bold", colour="black", size=20))
+```
+
+
+

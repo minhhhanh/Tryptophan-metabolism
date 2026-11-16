@@ -1,0 +1,521 @@
+---
+title: "1_preprocessing"
+author: "Hanh Nguyen Luu Minh"
+output: html_document
+---
+```{r}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 6,
+  out.width = "95%",
+  collapse = TRUE,
+  comment = "#>",
+  dev = "ragg_png",
+  dpi = 300
+)
+
+# force ragg device
+options(
+  knitr.graphics.auto_pdf = TRUE
+)
+
+# Reproducibility
+set.seed(1234)
+```
+# Libraries loading
+```{r}
+.libPaths("/home/hanhnlm@oucru.org/R/x86_64-pc-linux-gnu-library/4.5")
+pacman::p_load(openxlsx, readxl, writexl, dplyr, tidyr, tidyverse, tibble, stringr, ggplot2, ggpubr, Hmisc, naniar, gtsummary, forcats)
+theme_set(theme_bw())
+```
+# Paths
+```{r}
+rm(list = ls())
+data.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data")
+clinical.dir <- paste0(data.dir, "/clinical")
+untarget_met.dir <- paste0(data.dir, "/RCT_Untargeted_Metabolomics")
+target_met.dir <- paste0(data.dir, "/RCT_Targeted_Metabolomics")
+derived.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data\\Hanh_derived_data")
+output.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\results_nov")
+legacy.dir <- gsub("\\\\", "/", "R:\\Data Analysis Team\\Trial_TBM_26TB_27TB_PTB_28TB_29TB\\08_DILI_Bacterial_clearance\\output\\")
+xlsx_files <- list.files(data.dir, pattern = "\\.xlsx$")
+list.dirs(data.dir)
+list.files(untarget_met.dir)
+list.files(derived.dir)
+list.files(legacy.dir)
+list.files(clinical.dir)
+```
+# Functions
+```{r}
+source("function.R", local = knitr::knit_global())
+```
+# 1.1. Feature QC
+```{r targeted_met_annotation}
+list.files(target_met.dir)
+#> Process annotation file
+target_met_annot <- readxl::read_excel(path = paste0(target_met.dir, "/24_0125_ULTIMATE_RCT_TargHP_annotation.xlsx"), sheet = "Annotation")
+target_met_annot <- target_met_annot %>% dplyr::mutate(Study=substr(Subject_id,1,4))
+target_met_annot <- target_met_annot %>% 
+  mutate(
+    Sample_id2 = case_when(
+      Injection_type != "not_used" & Sample_id == "NA" ~ Colnames,
+      Injection_type != "not_used" & Sample_id != "NA" ~ Sample_id,
+      TRUE ~ NA_character_
+    )
+  )
+target_met_annot1 <- target_met_annot %>% dplyr::filter(!is.na(Sample_id2))
+View(target_met_annot1)
+table(target_met_annot1$Sample_type)
+```
+
+```{r load_target_met_abundance}
+target_met_sheets <- excel_sheets(paste0(target_met.dir, "/24_0125_ULTIMATE_RCT_TargHP.xlsx"))
+target_abu <- readxl::read_excel(path = paste0(target_met.dir, "/24_0125_ULTIMATE_RCT_TargHP.xlsx"), sheet = "Abundances", range = "A13:BCU28", col_names = FALSE)
+header_row <- as.character(unlist(target_abu[1, ]))
+header_row[header_row == ""] <- NA_character_
+dup <- duplicated(header_row)
+header_row[dup] <- paste0(header_row[dup], "_", seq_len(sum(dup)))
+colnames(target_abu) <- header_row; 
+target_abu <- target_abu[, -1]
+names(target_abu)[names(target_abu) == "Raw_file_name"] <- "Metabolite"
+names(target_abu)[1:5] <- c("Compound_ID", "MZ", "RT", "RefMetName", "HMDB_ID")
+
+target_abu_transpose <- target_abu %>% t()
+colnames(target_abu_transpose) <- as.character(target_abu_transpose[5, ])
+target_abu_transpose <- target_abu_transpose[-c(1:5), ] %>% as.data.frame() %>% dplyr::rename(Colnames = Metabolite)
+target_abu_transpose <- target_met_annot1 %>% dplyr::select(Raw_file_name, Colnames, Sample_type, Sample_id2) %>% dplyr::left_join(target_abu_transpose, by = c("Raw_file_name", "Colnames"))
+target_abu_transpose <- target_abu_transpose %>% tibble::column_to_rownames(var = "Raw_file_name")
+colnames(target_abu_transpose) <- trimws(colnames(target_abu_transpose))
+```
+
+```{r preprocess_target_met_abundance}
+dim(target_abu_transpose)
+class(target_abu_transpose)
+target_abu_transpose <- as.data.frame(target_abu_transpose)
+meta_cols <- c("Colnames", "Sample_type"); sample_cols <- setdiff(colnames(target_abu_transpose), meta_cols)
+#> QC-pooled_ref samples
+qc_samples <- target_abu_transpose$Colnames[grep("QC-pooled_ref",target_abu_transpose$Sample_type)]
+qc_samples
+qc_df <- target_abu_transpose %>% dplyr::filter(Colnames %in% qc_samples)
+
+#> Biological samples
+bio_samples <- target_abu_transpose$Sample_id2[grep("26TB|27TB",target_abu_transpose$Sample_id2)]
+bio_df <- target_abu_transpose %>% dplyr::filter(Sample_id2 %in% bio_samples) %>% 
+  dplyr::select(!dplyr::matches("phenylalanine-d8|valine-d8")) %>% dplyr::select(-all_of(meta_cols)) %>%
+  dplyr::mutate(across(-Sample_id2, as.numeric))
+
+#> QC procedure
+target_abu_transpose <- target_abu_transpose %>% dplyr::mutate(across(-c("Colnames", "Sample_type", "Sample_id2"), as.numeric))
+boxplot_df <- target_abu_transpose %>%
+  as.data.frame() %>%
+  `rownames<-`(NULL) %>%
+  tibble::column_to_rownames("Sample_id2") %>%
+  dplyr::mutate(across(where(is.numeric), ~ log2(. + 0.5)))
+# QC_drift_correction samples start with PREFA & pooled_QC samples start with PREFB
+pool_QC_samples <- colnames(boxplot_df)[grep("PREFB", colnames(boxplot_df))]
+pool_QC_drifts <- colnames(boxplot_df)[grep("PREFA", colnames(boxplot_df))]
+boxplot_df1 <- boxplot_df %>% dplyr::select(all_of(pool_QC_drifts))
+dim(boxplot_df1)
+colnames(boxplot_df1) <- gsub("VAN_ULTIMATE_RCT_HN-", "", colnames(boxplot_df1))
+
+boxplot_df <- boxplot_df %>% dplyr::select(-all_of(pool_QC_samples))
+
+plot_df <- boxplot_df[, 1:101, drop = FALSE]
+color_panel <- ifelse(grepl("PREFA", colnames(plot_df)), "#E10600", "#83aff0")
+cols <- colnames(boxplot_df1)
+par(mar = c(4, 2, 2, 2))
+bp <- boxplot(
+  plot_df,
+  col = color_panel,
+  outline = FALSE,
+  xaxt = "n",
+  ylab = "log2(Intensity)"
+)
+
+axis(
+  side = 1,
+  at = seq_along(plot_df),
+  labels = colnames(plot_df),
+  las = 3,
+  cex.axis = 0.6
+)
+
+bp1 <- boxplot(
+  boxplot_df1,
+  col = "#83aff0",
+  outline = FALSE,
+  xaxt = "n",
+  ylab = "log2(Intensity)"
+)
+```
+
+```{r featureQC_target_met_abundance}
+pool_QC_drift_df <- target_met_annot %>% dplyr::filter(Sample_type == "QC-drift_correction")
+pool_QC_df <- target_met_annot %>% dplyr::filter(Sample_type == "QC-pooled_ref")
+pool_QC_df <- pool_QC_df %>% dplyr::select(Raw_file_name, Colnames)
+pool_QC_samples <- pool_QC_df$Colnames
+
+pool_QC_drift_samples <- pool_QC_drift_df$Raw_file_name
+rownames(bio_df) <- NULL
+
+qc_df <- target_abu_transpose %>% dplyr::filter(Colnames %in% pool_QC_samples)
+dim(qc_df)
+
+#> Remove PREFB45 pooled QC sample
+qc_totals <- rowSums(qc_df %>% dplyr::select(-c("Colnames", "Sample_type", "Sample_id2")), na.rm = TRUE)
+qc_totals
+plot(qc_totals, type="b", main="Total ion intensity per QC", ylab="Total intensity", xlab = "Sample index")
+text(
+  x = 1:length(qc_totals),
+  y = qc_totals,
+  labels = names(qc_totals),
+  pos = 3,              # 3 = above
+  cex = 0.7             # smaller font
+)
+qc_df <- qc_df %>%
+  dplyr::filter(Colnames != "PREFB45")
+
+#> Detect features that missing >25% across all sample
+missing_count <- apply(bio_df, 2, function(x) {
+  sum(is.na(x)) / ncol(bio_df)
+})
+missing_count
+#> CV >30%
+cv <- apply(qc_df %>% dplyr::select(-c("Colnames", "Sample_type", "Valine-d8 [iSTD]", "Phenylalanine-d8 [iSTD]")), 2,
+                 function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE)*100)
+#> Detect features that missing >25% across QC sample
+missing_count_qc <- apply(qc_df, 2, function(x){
+  sum(is.na(x)) / ncol(qc_df)
+})
+
+#> Check the stable of the internal standard
+IS_names <- c("Valine-d8 [iSTD]", "Phenylalanine-d8 [iSTD]")
+sapply(IS_names, function(nm) summary(as.numeric(qc_df[[nm]])))
+IS_CV <- sapply(IS_names, function(nm) {
+  x <- as.numeric(qc_df[[nm]])
+  100*sd(x, na.rm = T)/mean(x, na.rm = T)
+})
+IS_CV
+#> internal standard injection is consistent; Ion source stability is good
+
+missing_cut_off <- 25
+cv_cut_off <- 30
+mets_remove1 <- names(which(missing_count > missing_cut_off))
+mets_remove2 <- names(which(missing_count_qc > missing_cut_off))
+mets_remove3 <- names(which(cv > cv_cut_off))
+mets_remove <- unique(c(mets_remove1,mets_remove2,mets_remove3))
+
+bio_df <- bio_df[,-(which(colnames(bio_df) %in% mets_remove))]
+View(bio_df)
+#> How many LOD values left for imputation
+lod_count <- colSums(is.na(bio_df))
+lod_count
+mat <- apply(bio_df %>% dplyr::select(-Sample_id2), 2, as.numeric)
+boxplot(log2(mat), horizontal = T, 
+        las=1, main='(Log2) abundance before imputation',
+        col="steelblue")
+# LOD imputation
+bio_df <- bio_df %>%
+  dplyr::mutate(
+    dplyr::across(-Sample_id2, imputeHalfMin)
+  )
+#> Only retained VN samples
+vn_samples <- str_extract(
+  bio_df$Sample_id2,
+  "\\d{2}TB-\\d{3}-\\d{3,4}-D\\d+"
+)
+bio_df <- bio_df %>% dplyr::filter(Sample_id2 %in% vn_samples)
+dim(bio_df)
+save(bio_df, file = file.path(derived.dir, "Target_Feature_QCed.RData"))
+```
+
+# 1.2. Normalization
+```{r}
+library(matrixStats)
+library(scales)
+epsilon <- 1
+bio_scaled <- bio_df %>%
+  dplyr::mutate(across(everything(), ~ {
+    x <- .
+    x_shift <- x - min(x, na.rm = TRUE) + 1e-6
+    log2(x_shift)
+  }))
+bio_scaled <- scale(bio_scaled)
+bio_scaled <- as.data.frame(bio_scaled)
+bio_long <- bio_scaled %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Metabolite",
+    values_to = "Value"
+  )
+ggplot(bio_long, aes(x = Value, color = Metabolite)) +
+  geom_density(fill = NA, linewidth = 1) +
+  labs(
+    title = "Density distribution of metabolites",
+    x = "Value",
+    y = "Density"
+  ) +
+  theme_bw()
+
+ggplot(bio_long, aes(x = Metabolite, y = Value, fill = Metabolite)) +
+  geom_boxplot(outlier.shape = 16, color = "black") +
+  theme_bw() +
+  labs(
+    title = "Log2-scaled metabolite distributions",
+    x = "",
+    y = "Log2-scaled value"
+  ) +
+  scale_fill_brewer(palette = "Blues")
+```
+# 1.3. Sample QC
+```{r}
+load(file.path(clinical.dir, "UpdatedClinical_Mar2026.RData"))
+bsl_clinic_27tb <- bsl_clinic_27tb %>% dplyr::select(STUDYID, Subject_id, SEX, AGE, CSFWBC, CSFNEU, CSFLYM, CSFNEUPCT, CSFLYMLEPCT, CSFPROTEIN,
+                                                     TBMGRADE, LTA4H, arm, ev_2m, tt_ev_2m) 
+bsl_clinic_26tb <- bsl_clinic_26tb %>% dplyr::select(study, Subject_id, SEX, AGE, CSFWBC, CSFNEUTLE, CSFLYMLE, TOTALCSFLYMLE, TOTALCSFNEUTLE,
+                                                     PROTEIN, BLDCD4, TBMGRADE, LTA4H, arm, ev_2m, tt_ev_2m) %>% dplyr::rename(STUDY = study)
+```
+
+```{r}
+#> Using PCA score deviation for outliers marking and removal
+bio_scaled <- bio_scaled %>% as.data.frame() %>% remove_rownames() %>% tibble::column_to_rownames(var = "Sample_id2")
+colnames(bio_scaled) <-  gsub("\\s+", "", colnames(bio_scaled))
+metabolites <- c(
+  "Tryptophan","Nicotinamide","5-HIAA","5-HydroxyTryptamine",
+  "Kynurenine","AntranilicAcid","5-HydroxyTryptophol",
+  "Alanine","3-IndoleaceticAcid","KynurenicAcid"
+)
+metab_mat <- bio_scaled %>%
+  dplyr::select(all_of(metabolites)) %>% dplyr::mutate(across(everything(), as.numeric))
+tar_pca <- prcomp(metab_mat, center = FALSE, scale. = FALSE)
+summary(tar_pca)
+#> 3SD on each PC approach
+data_check_outlier <- tar_pca$x %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Colnames") %>% 
+  mutate(
+    Study = str_extract(Colnames, "^2[6,7]TB"),
+    Subject_id = sub("-D[0-9]+$", "", Colnames)
+  ) %>% 
+  dplyr::select(Study, everything()) %>% 
+  mutate(
+    def_study_f = factor(Study),
+    Fail_QC = case_when(
+      PC1 > mean(PC1) + 3*sd(PC1) ~ "fail_PC1",
+      PC1 < mean(PC1) - 3*sd(PC1) ~ "fail_PC1",
+
+      PC2 > mean(PC2) + 3*sd(PC2) ~ "fail_PC2",
+      PC2 < mean(PC2) - 3*sd(PC2) ~ "fail_PC2",
+
+      PC3 > mean(PC3) + 3*sd(PC3) ~ "fail_PC3",
+      PC3 < mean(PC3) - 3*sd(PC3) ~ "fail_PC3",
+
+      .default = "pass"
+    ),
+    Sample_annot = if_else(Colnames == "NA", Subject_id, Colnames)
+  )
+data_check_outlier <- data_check_outlier %>% distinct()
+outlier <- data_check_outlier$Colnames[grep("fail",data_check_outlier$Fail_QC)]
+outlier1 <- data_check_outlier$Colnames[grep("fail_PC1",data_check_outlier$Fail_QC)]
+outlier2 <- data_check_outlier$Colnames[grep("fail_PC2",data_check_outlier$Fail_QC)]
+outlier3 <- data_check_outlier$Colnames[grep("fail_PC3",data_check_outlier$Fail_QC)]
+## Elbow plot
+pca_var <- tar_pca$sdev^2   
+pca_var_prop <- pca_var / sum(pca_var)
+elbow_df <- data.frame(
+  PC = 1:length(pca_var_prop),
+  Variance_Explained = pca_var_prop
+) %>% dplyr::slice(1:10)
+ggplot(elbow_df, aes(x = PC, y = Variance_Explained)) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    x = "Principal Component",
+    y = "Proportion of Variance Explained",
+    title = "Elbow Plot for Top 10 PCs"
+  ) +
+  theme_minimal(base_size = 14)
+#> Plot the hyperplane
+data_check_outlier %>% 
+  ggplot(aes(x=PC1, y=PC2, color = def_study_f)) + 
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.99)+
+  scale_color_manual(values=c("#0072B2", "#D55E00"))+
+  ggrepel::geom_label_repel(data=subset(data_check_outlier,Colnames %in% outlier), aes(x=PC1, y=PC2,
+                                                                            label=Sample_annot),force=19)+
+  theme_bw()+
+  theme(legend.position = 'none')
+## 3SD boundaries adding
+pc_stats <- data_check_outlier %>%
+  summarise(
+    m1 = mean(PC1), sd1 = sd(PC1),
+    m2 = mean(PC3), sd2 = sd(PC2))
+data_check_outlier %>% 
+  ggplot(aes(x = PC1, y = PC3, color = def_study_f)) + 
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.99) +
+  ## 3 SD boundaries (exact QC rule)
+  geom_vline(
+    xintercept = c(pc_stats$m1 - 3*pc_stats$sd1,
+                   pc_stats$m1 + 3*pc_stats$sd1),
+    linetype = "dashed", color = "darkred", linewidth=1.2
+  ) +
+  geom_hline(
+    yintercept = c(pc_stats$m2 - 3*pc_stats$sd2,
+                   pc_stats$m2 + 3*pc_stats$sd2),
+    linetype = "dashed", color = "darkred", linewidth=1.2
+  ) +
+  scale_color_manual(values = c("#0072B2", "#D55E00")) +
+  ggrepel::geom_label_repel(
+    data = subset(data_check_outlier, Colnames %in% outlier),
+    aes(label = Sample_annot),
+    force = 19
+  ) +
+  labs(x = "PC1 (39.65%)",
+       y = "PC3 (11.68%)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title = element_text(face="bold", size=15, color="black"),
+        axis.text = element_text(face="bold", size=13, color="black"))
+
+data_check_outlier %>% 
+  ggplot(aes(x=PC1, y=PC3, color = def_study_f)) + 
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.99)+
+  scale_color_manual(values=c("#0072B2", "#D55E00"))+
+  ggrepel::geom_label_repel(data=subset(data_check_outlier,Colnames %in% outlier), 
+                           aes(x=PC1, y=PC3,label=Sample_annot),
+                           force=19
+                           )+
+  theme_bw()+
+  theme(legend.position = 'none')
+
+library(plotly)
+labels <- ifelse(data_check_outlier$Colnames %in% outlier,
+                 data_check_outlier$Sample_annot,
+                 "")
+
+# 3D PCA plot with outlier labels
+plot_ly(
+  data = data_check_outlier,
+  x = ~PC1,
+  y = ~PC2,
+  z = ~PC3,
+  color = ~def_study_f,
+  colors = c("#0072B2", "#D55E00"),
+  type = "scatter3d",
+  mode = "markers+text",
+  text = labels,
+  textposition = "top center",
+  marker = list(size = 5)
+) %>%
+  layout(
+    width = 1000,
+    height = 1000,
+    scene = list(
+      xaxis = list(title = "PC1 (39.65%)"),
+      yaxis = list(title = "PC2 (15.15%)"),
+      zaxis = list(title = "PC3 (11.38%)")
+    ),
+    legend = list(title = list(text = "Study"))
+  )
+```
+
+```{r target_hierarchical_clutering_to_confirm}
+sampleTree <- hclust(dist(metab_mat, method = "euclidean"), method = "average")
+# Create a color vector: outliers in red, others in black
+sample_colors <- ifelse(rownames(metab_mat) %in% outlier, "darkred", "grey")
+# Plot dendrogram with colored labels
+suppressPackageStartupMessages(library(dendextend))
+dend <- as.dendrogram(sampleTree)
+# Create color vector aligned with labels
+label_colors <- ifelse(labels(dend) %in% outlier, "darkred", "grey")
+# Apply label colors
+dend <- dend %>%
+  set("labels_col", label_colors) %>%
+  set("labels_cex", 0.7)
+
+plot(dend, main = "Sample clustering with outliers")
+#> Remove flagged outlier: 8 samples of 27TB and 4 samples of 26TB
+bio_scaled <- bio_scaled[!(rownames(bio_scaled) %in% outlier), ]
+dim(bio_scaled) # 515 samples of 26TB and 587 samples of 27TB
+save(bio_scaled, file = file.path(derived.dir, "QCed_Data.RData"))
+```
+
+```{r}
+dend <- as.dendrogram(sampleTree)
+# Replace labels: only show outliers
+labels(dend) <- ifelse(
+  labels(dend) %in% outlier,
+  labels(dend),
+  "")
+# Color outliers
+dend <- dend %>%
+  set("labels_col", ifelse(labels(dend) %in% outlier, "darkred", NA)) %>%
+  set("labels_cex", 0.8)
+plot(dend, main = "Sample clustering (outliers highlighted)")
+```
+
+```{r outlier_characteristic_checkup}
+colnames(baseline_clinic)
+outlier_sub <- sub("(?=-D(?:0|30)$).*", "", outlier, perl = TRUE)
+outlier_sub
+all(outlier_sub %in% baseline_clinic$Subject_id)
+outlier_clinic <- baseline_clinic %>% dplyr::filter(Subject_id %in% outlier_sub)
+dim(outlier_clinic)
+View(outlier_clinic)
+
+check_clinical <- baseline_clinic %>% dplyr::filter(Subject_id %in% clinical_sub$Subject_id) %>% dplyr::mutate(sample_type = ifelse(Subject_id %in% outlier_sub, "Outlier", "NonOutlier"))
+colnames(check_clinical)
+describe(check_clinical$sample_type)
+# Boxplot for comparision
+num_vars <- check_clinical %>%
+  select(where(is.numeric)) %>%
+  colnames()
+num_vars <- setdiff(num_vars, c("ttdeath", "evdeath", "HIV_viralload", "CD4", "TBMGRADE"))
+
+df_long <- check_clinical %>%
+  select(sample_type, all_of(num_vars[21:26])) %>%
+  pivot_longer(
+    cols = -sample_type,
+    names_to = "variable",
+    values_to = "value"
+  )
+ggplot(df_long, aes(x = sample_type, y = value, fill = sample_type)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = sample_type),
+              width = 0.2, alpha = 1, size = 1) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 5) +
+  scale_fill_manual(values = c(
+    NonOutlier = "#4C72B0",
+    Outlier    = "#DD8452"
+  )) +
+  scale_color_manual(values = c(
+    NonOutlier = "#4C72B0",
+    Outlier    = "#DD8452"
+  )) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(face = "bold", color = "black")
+  )
+#> It is valid to remove these outliers, mostly due to measurement variation, not due to any particular clinical factors that we should rely on
+```
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,141 @@
+---
+title: "Table1_PatientCharacteristic"
+author: "Hanh Nguyen Luu Minh"
+output: html_document
+---
+```{r}
+data.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data")
+clinical.dir <- paste0(data.dir, "/clinical")
+untarget_met.dir <- paste0(data.dir, "/RCT_Untargeted_Metabolomics")
+target_met.dir <- paste0(data.dir, "/RCT_Targeted_Metabolomics")
+derived.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\Raw_data\\Hanh_derived_data")
+output.dir <- gsub("\\\\", "/", "R:\\hanhnlm\\Metabolite_Ultimate\\ULTIMATE_LCMS_batch2\\results_nov")
+```
+
+```{r}
+library(gtsummary)
+library(flextable)
+library(dplyr)
+
+print(load(file.path(clinical.dir, "UpdatedClinical_Mar2026.RData")))
+vars <- c(
+  "AGE", "SEX", "TBMGRADE", "LTA4H",
+  "CSFWBC", "CSFNEUTLE", "CSFLYMLE",
+  "PROTEIN", "CSFGLUCRATIO",
+  "outcome_2m", "outcome_12m",
+  "arm"
+)
+bsl_clinic_26tb <- bsl_clinic_26tb %>%
+  mutate(LTA4H = recode(LTA4H, "TC" = "CT")) %>% dplyr::rename(CSFGLUCRATIO = CSF_BL_GLUC) %>%
+  left_join(Baseline_26TB %>% dplyr::select(USUBJID, outcome_2m, outcome_12m), by = "USUBJID")
+bsl_clinic_27tb <- bsl_clinic_27tb %>% left_join(Baseline_27TB %>% dplyr::select(USUBJID, CSFGLUCRATIO, outcome_2m, outcome_12m), by = "USUBJID") %>%
+  dplyr::rename(PROTEIN = CSFPROTEIN)
+bsl_clinic_26tb$SEX <- factor(bsl_clinic_26tb$SEX, levels = c("M", "F"))
+bsl_clinic_27tb$SEX <- factor(bsl_clinic_27tb$SEX, levels = c("M", "F"))
+make_table1_strict <- function(df) {
+  df %>%
+    select(all_of(vars)) %>%
+    tbl_summary(
+      by = arm,
+      type = list(
+        AGE ~ "continuous",
+        SEX ~ "dichotomous",
+        TBMGRADE ~ "categorical",
+        LTA4H ~ "categorical",
+        CSFWBC ~ "continuous",
+        CSFNEUTLE ~ "continuous",
+        CSFLYMLE ~ "continuous",
+        PROTEIN ~ "continuous",
+        CSFGLUCRATIO ~ "continuous",
+        outcome_2m ~ "dichotomous",
+        outcome_12m ~ "dichotomous"
+      ),
+      value = list(
+        SEX ~ "M",
+        outcome_2m ~ "Deceased",
+        outcome_12m ~ "Deceased"
+      ),
+      statistic = list(
+        all_continuous() ~ "{median} ({p25}–{p75})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      digits = list(
+      all_continuous() ~ c(2, 2), # e.g., 2 digits for mean and sd
+      all_categorical() ~ c(0, 1) # e.g., 0 for counts, 1 for percentages),
+      ),
+      missing = "no",
+      
+      label = list(
+        AGE ~ "Age, yrs",
+        SEX ~ "Male, No. (%)",
+        TBMGRADE ~ "Tuberculous meningitis grade (%)",
+        LTA4H ~ "LTA4H genotype (%)",
+        CSFWBC ~ "Total leukocytes, cells/μL",
+        CSFNEUTLE ~ "Neutrophils, cells/μL",
+        CSFLYMLE ~ "Lymphocytes, cells/μL",
+        PROTEIN ~ "Protein level, g/L",
+        CSFGLUCRATIO ~ "CSF:blood glucose ratio",
+        outcome_2m ~ "2-month mortality, deceased, no. (%)",
+        outcome_12m ~ "12-month mortality, deceased, no. (%)"
+      )
+    ) %>%
+    
+    add_p(
+      test = list(
+        all_continuous() ~ "wilcox.test",
+        all_categorical() ~ "fisher.test"
+      )
+    ) %>%
+    
+    modify_table_body(
+      ~ .x %>%
+        dplyr::mutate(
+          p.value = ifelse(
+            is.nan(as.numeric(p.value)),
+            NA,
+            p.value
+          )
+        )
+    ) %>%
+    add_overall() %>%
+    add_variable_group_header(
+      variables = c(
+        "CSFWBC",
+        "CSFNEUTLE",
+        "CSFLYMLE",
+        "PROTEIN",
+        "CSFGLUCRATIO"
+      ),
+      header = "Cerebrospinal fluid features"
+    ) %>%
+    
+    add_variable_group_header(
+      variables = c("outcome_2m", "outcome_12m"),
+      header = "Outcome"
+    )
+}
+tbl_26TB <- make_table1_strict(bsl_clinic_26tb)
+tbl_27TB <- make_table1_strict(bsl_clinic_27tb)
+tbl_horizontal <- tbl_merge(
+  tbls = list(tbl_27TB, tbl_26TB),
+  tab_spanner = c(
+    "**HIV-negative TBM**",
+    "**HIV-positive TBM**"
+  )
+) %>%
+  as_flex_table()
+
+library(officer)
+doc <- read_docx() %>%
+  body_end_section_landscape() %>%
+  body_add_flextable(tbl_horizontal)
+
+print(
+  doc,
+  target = paste0(
+    output.dir,
+    "/Table1.Patients_Characteristic.docx"
+  )
+)
+```
+

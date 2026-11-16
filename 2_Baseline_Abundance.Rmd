@@ -1,0 +1,180 @@
+---
+title: "BaselineMets: Boxplot for baseline level comparision"
+author: "Hanh Nguyen"
+date: "2026-05-11"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 6,
+  out.width = "95%",
+  collapse = TRUE,
+  comment = "#>",
+  dev = "ragg_png",
+  dpi = 300
+)
+# force ragg device
+options(
+  knitr.graphics.auto_pdf = TRUE
+)
+# Reproducibility
+set.seed(1234)
+```
+
+```{r path}
+setwd("/home/ubuntu/tb_volume/hanhnlm/metabolomics/")
+list.dirs(".")
+```
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggbeeswarm)
+library(ggpubr)
+# install.packages("rstatix")
+library(rstatix)
+library(patchwork)
+```
+
+```{r}
+print(load("./deriveddata/Abundance_JMInput_April2026.RData"))
+```
+
+Boxplot for baseline level of TRP metabolites
+```{r}
+colnames(jm_abu_inputdata_26$long_data)
+plot_hiv_df <- jm_abu_inputdata_26$long_data %>% dplyr::filter(day == 0) %>% dplyr::select(-c("Subject_id", "day", "study"))
+plot_df <- jm_abu_inputdata_27$long_LTA4Hrm %>% dplyr::filter(day == 0) %>% dplyr::select(-c("Subject_id", "day", "study"))
+```
+
+```{r}
+plot_long_df <- plot_df %>%
+  pivot_longer(
+    cols = -arm,          # pivot all columns except arm
+    names_to = "Metabolite",
+    values_to = "Value"
+  )
+
+head(plot_long_df)
+
+plot_hiv_long_df <- plot_hiv_df %>%
+  pivot_longer(
+    cols = -arm,
+    names_to = "Metabolite",
+    values_to = "Value"
+  )
+
+plot_all <- bind_rows(
+  plot_long_df,
+  plot_hiv_long_df
+)
+
+name_map <- c(
+  "Tryptophan" = "Tryptophan",
+  "Nicotinamide" = "Nicotinamide",
+  "5-HIAA" = "5-hydroxyindoleacetic acid",
+  "5-HydroxyTryptamine" = "5-Hydroxytryptamine",
+  "Kynurenine" = "Kynurenine",
+  "AntranilicAcid" = "Anthranilic acid",
+  "5-HydroxyTryptophol" = "5-hydroxytryptophol",
+  "Alanine" = "Alanine",
+  "3-IndoleaceticAcid" = "Indole-3-acetic acid",
+  "KynurenicAcid" = "Kynurenic acid"
+)
+
+plot_long_df$Metabolite <- name_map[plot_long_df$Metabolite]
+
+met_order <- c("Tryptophan", "Kynurenine", "Kynurenic acid", "Anthranilic acid", "Nicotinamide","Alanine", 
+               "5-Hydroxytryptamine", "5-hydroxyindoleacetic acid", "5-hydroxytryptophol", "Indole-3-acetic acid")
+plot_long_df$Metabolite <- factor(plot_long_df$Metabolite,levels = met_order)
+stat_df <- plot_long_df %>%
+  group_by(Metabolite) %>%
+  wilcox_test(Value ~ arm) %>%
+  adjust_pvalue(method = "BH") %>%
+  mutate(p_text = format(p.adj, scientific = TRUE, digits = 2))
+plot_list <- list()
+for (met in met_order) {
+  sub_df <- plot_long_df %>%
+    filter(Metabolite == met)
+  sub_stat <- stat_df %>%
+    filter(Metabolite == met)
+  ymax <- max(sub_df$Value, na.rm = TRUE)
+  ymin <- min(sub_df$Value, na.rm = TRUE)
+  
+  yrange <- ymax - ymin
+  
+  bar_y  <- ymax + 0.12 * yrange
+  text_y <- ymax + 0.18 * yrange
+  
+  p <- ggplot(sub_df, aes(x = arm, y = Value, color = arm)) +
+    # geom_boxplot(
+    #   width = 0.65,
+    #   fill = NA,
+    #   linewidth = 1.2,
+    #   outlier.shape = NA) +  
+    # geom_jitter(width = 0.12, size = 2, alpha = 0.6) + 
+    geom_beeswarm(method = "center", size = 2, cex = 1, alpha = 0.6) + 
+    stat_summary(fun.data = function(x) {
+      data.frame(
+        y = median(x),
+        ymin = quantile(x, 0.25),
+        ymax = quantile(x, 0.75)
+      )
+    },geom = "errorbar",
+    width = 0.18,
+    linewidth = 1, color = "black") +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      shape = 95,
+      size = 15,
+      color = "black"
+    ) +
+    annotate("segment",x = 1,xend = 2, y = bar_y, yend = bar_y, linewidth = 0.8) +
+    annotate("segment",x = 1,xend = 1, y = bar_y - 0.03 * yrange, yend = bar_y,linewidth = 0.8) +
+    annotate("segment", x = 2, xend = 2,y = bar_y - 0.03 * yrange, yend = bar_y, linewidth = 0.8) +
+    annotate("text", x = 1.5, y = text_y, label = sub_stat$p_text, size = 4) +
+    expand_limits(y = text_y + 0.05 * yrange) +
+    scale_color_manual(values = c("Placebo" = "#a1caf1","Dexamethasone" = "#be0032")) +
+    labs(title = met,x = NULL, y = "Log2(Peak intensity)") +
+    theme_classic() +
+    theme(
+      aspect.ratio = 1,
+      plot.margin = margin(t = 10,r = 10,b = 30,l = 10),
+      plot.title = element_text(hjust = 0, size = 16, face = "bold"),
+      panel.background=element_rect(fill = 'white', colour = 'white'),
+        axis.title.x = element_text(face="bold", colour="black", size=14),
+        axis.title.y = element_text(face="plain", colour="black", size=14),
+        axis.text.y = element_text(face="plain", colour="black", size=12),
+        axis.text.x = element_text(face="plain", colour="black", size=12),
+        axis.ticks.x = element_blank(),
+        legend.text = element_text(face="plain", colour = "black", size = 12),
+        # legend.title = element_blank(),
+        legend.key = element_rect(colour = NA),
+        legend.position = "none",
+        strip.text=element_text(face = "bold", size=12),
+        panel.grid.minor = element_blank())
+  plot_list[[met]] <- p
+}
+combined_plot <- wrap_plots(plot_list, ncol = 5)
+combined_plot
+ggsave(
+  filename = "./plots/Metabolite_HIV_comparison.tiff",
+  plot = combined_plot,
+  width = 20,
+  height = 8,
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
